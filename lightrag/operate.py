@@ -341,6 +341,10 @@ async def _summarize_descriptions(
     joined_descriptions = "\n".join(
         json.dumps(desc, ensure_ascii=False) for desc in truncated_json_descriptions
     )
+    descriptions_json = json.dumps(
+        [desc["Description"] for desc in truncated_json_descriptions],
+        ensure_ascii=False,
+    )
 
     # Prepare context for the prompt
     context_base = dict(
@@ -349,6 +353,8 @@ async def _summarize_descriptions(
         description_list=joined_descriptions,
         summary_length=summary_length_recommended,
         language=language,
+        entity_name=description_name,
+        descriptions=descriptions_json,
     )
     use_prompt = prompt_template.format(**context_base)
 
@@ -454,15 +460,32 @@ async def _handle_single_relationship_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
 ):
-    if (
-        len(record_attributes) != 5 or "relation" not in record_attributes[0]
-    ):  # treat "relationship" and "relation" interchangeable
+    if len(record_attributes) < 5 or "relation" not in record_attributes[0]:
         if len(record_attributes) > 1 and "relation" in record_attributes[0]:
             logger.warning(
                 f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
             )
             logger.debug(record_attributes)
         return None
+
+    if len(record_attributes) > 5:
+        logger.warning(
+            f"{chunk_key}: LLM output format warning; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`, merging extra fields into description"
+        )
+        original_description = record_attributes[4]
+        extra_fields = record_attributes[4:]
+        weight_field = None
+        if extra_fields:
+            tail = extra_fields[-1].strip('"').strip("'")
+            if is_float_regex(tail):
+                weight_field = extra_fields[-1]
+                extra_fields = extra_fields[:-1]
+        merged_description = " ".join(field for field in extra_fields if field)
+        if not merged_description.strip():
+            merged_description = original_description
+        record_attributes = record_attributes[:4] + [merged_description]
+        if weight_field is not None:
+            record_attributes.append(weight_field)
 
     try:
         source = sanitize_and_normalize_extracted_text(
@@ -2790,6 +2813,9 @@ async def extract_entities(
     entity_types = global_config["addon_params"].get(
         "entity_types", DEFAULT_ENTITY_TYPES
     )
+    relation_types = global_config["addon_params"].get("relation_types", [])
+    if isinstance(relation_types, str):
+        relation_types = [relation_types]
 
     examples = "\n".join(PROMPTS["entity_extraction_examples"])
 
@@ -2806,6 +2832,7 @@ async def extract_entities(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
         entity_types=",".join(entity_types),
+        relation_types=",".join(relation_types) if relation_types else "",
         examples=examples,
         language=language,
     )

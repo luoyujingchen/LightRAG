@@ -1,8 +1,230 @@
 from __future__ import annotations
-from typing import Any
+import os
+import re
+import logging
+import threading
+from pathlib import Path
+from typing import Any, Optional
 
+logger = logging.getLogger(__name__)
 
 PROMPTS: dict[str, Any] = {}
+
+# Lock for thread-safe prompt updates
+_prompts_lock = threading.RLock()
+
+# Regex pattern to match YAML front matter
+FRONT_MATTER_PATTERN = re.compile(r'^---\s*\n(.*?)\n---\s*\n', re.DOTALL)
+
+# Mapping from custom prompt file IDs to LightRAG internal keys
+# This allows using friendly names like "lightrag.entity_extract" in files
+# while mapping to LightRAG's internal keys like "entity_extraction_system_prompt"
+PROMPT_ID_MAPPING: dict[str, str] = {
+    # Entity extraction
+    "lightrag.entity_extract": "entity_extraction_system_prompt",
+    "lightrag.relation_extract": "entity_extraction_system_prompt",
+    "lightrag.entity_extract_user": "entity_extraction_user_prompt",
+    "lightrag.entity_continue": "entity_continue_extraction_user_prompt",
+    "lightrag.entity_examples": "entity_extraction_examples",
+    # Entity/relation merging
+    "lightrag.entity_merge": "summarize_entity_descriptions",
+    # Keyword extraction
+    "lightrag.keyword_extract": "keywords_extraction",
+    "lightrag.keyword_examples": "keywords_extraction_examples",
+    # RAG response
+    "lightrag.qa_generate": "rag_response",
+    "lightrag.naive_response": "naive_rag_response",
+    # Context templates
+    "lightrag.kg_context": "kg_query_context",
+    "lightrag.naive_context": "naive_query_context",
+    # Other
+    "lightrag.fail_response": "fail_response",
+}
+
+# Reverse mapping for lookup
+PROMPT_KEY_TO_ID: dict[str, str] = {v: k for k, v in PROMPT_ID_MAPPING.items()}
+
+# Priority for resolving duplicate mappings (higher wins)
+PROMPT_ID_PRIORITY: dict[str, int] = {
+    "lightrag.entity_extract": 100,
+    "lightrag.relation_extract": 90,
+}
+
+
+def _parse_yaml_front_matter(content: str) -> tuple[dict[str, Any], str]:
+    """Parse YAML front matter from markdown content.
+
+    Returns:
+        Tuple of (metadata dict, content without front matter)
+    """
+    match = FRONT_MATTER_PATTERN.match(content)
+    if not match:
+        return {}, content
+
+    yaml_content = match.group(1)
+    body = content[match.end():]
+
+    # Simple YAML parser for basic key-value pairs
+    metadata = {}
+    current_key = None
+    current_list = None
+
+    for line in yaml_content.split('\n'):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+
+        # Check for list item
+        if stripped.startswith('- '):
+            if current_list is not None:
+                current_list.append(stripped[2:].strip())
+            continue
+
+        # Check for key-value pair
+        if ':' in stripped:
+            key, _, value = stripped.partition(':')
+            key = key.strip()
+            value = value.strip()
+
+            # End previous list if any
+            if current_list is not None and current_key:
+                metadata[current_key] = current_list
+                current_list = None
+                current_key = None
+
+            if value:
+                # Handle quoted strings
+                if (value.startswith('"') and value.endswith('"')) or \
+                   (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                # Handle booleans
+                elif value.lower() == 'true':
+                    value = True
+                elif value.lower() == 'false':
+                    value = False
+                metadata[key] = value
+            else:
+                # Start of a list
+                current_key = key
+                current_list = []
+
+    # Handle final list
+    if current_list is not None and current_key:
+        metadata[current_key] = current_list
+
+    return metadata, body
+
+
+def load_prompt_from_file(file_path: str | Path) -> tuple[str, str, dict[str, Any]]:
+    """Load a single prompt from a markdown file.
+
+    Args:
+        file_path: Path to the markdown file
+
+    Returns:
+        Tuple of (prompt_id, content, metadata)
+    """
+    file_path = Path(file_path)
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        raw_content = f.read()
+
+    metadata, content = _parse_yaml_front_matter(raw_content)
+
+    # Get prompt_id from metadata or derive from filename
+    prompt_id = metadata.get('prompt_id')
+    if not prompt_id:
+        # e.g., "lightrag.entity_extract.md" -> "lightrag.entity_extract"
+        prompt_id = file_path.stem
+
+    return prompt_id, content.strip(), metadata
+
+
+def load_prompts_from_dir(
+    prompt_dir: str | Path,
+    prompt_ext: str = ".md"
+) -> dict[str, str]:
+    """Load all prompts from a directory.
+
+    Args:
+        prompt_dir: Directory containing prompt files
+        prompt_ext: File extension to look for (default: .md)
+
+    Returns:
+        Dict mapping prompt_id to prompt content
+    """
+    prompt_dir = Path(prompt_dir)
+    loaded_prompts = {}
+
+    if not prompt_dir.exists():
+        logger.warning(f"Prompt directory does not exist: {prompt_dir}")
+        return loaded_prompts
+
+    for file_path in prompt_dir.glob(f"*{prompt_ext}"):
+        try:
+            prompt_id, content, metadata = load_prompt_from_file(file_path)
+            loaded_prompts[prompt_id] = content
+            logger.debug(f"Loaded prompt '{prompt_id}' from {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to load prompt from {file_path}: {e}")
+
+    logger.info(f"Loaded {len(loaded_prompts)} prompts from {prompt_dir}")
+    return loaded_prompts
+
+
+def update_prompts(custom_prompts: dict[str, str]) -> None:
+    """Update the global PROMPTS dict with custom prompts.
+
+    Applies PROMPT_ID_MAPPING to translate custom IDs to LightRAG internal keys.
+    Thread-safe via _prompts_lock.
+
+    Args:
+        custom_prompts: Dict mapping prompt_id to prompt content
+    """
+    mapped_count = 0
+    direct_count = 0
+
+    with _prompts_lock:
+        resolved_mappings: dict[str, str] = {}
+        sorted_prompt_ids = sorted(
+            custom_prompts.keys(),
+            key=lambda pid: PROMPT_ID_PRIORITY.get(pid, 0),
+            reverse=True,
+        )
+        for prompt_id in sorted_prompt_ids:
+            content = custom_prompts[prompt_id]
+            # Check if this ID needs mapping
+            if prompt_id in PROMPT_ID_MAPPING:
+                internal_key = PROMPT_ID_MAPPING[prompt_id]
+                if internal_key in resolved_mappings:
+                    logger.warning(
+                        "Skipping prompt '%s' mapped to '%s' (already set by '%s')",
+                        prompt_id,
+                        internal_key,
+                        resolved_mappings[internal_key],
+                    )
+                    continue
+                PROMPTS[internal_key] = content
+                resolved_mappings[internal_key] = prompt_id
+                mapped_count += 1
+                logger.debug(f"Mapped '{prompt_id}' -> '{internal_key}'")
+            else:
+                # Use directly (for custom keys or already internal keys)
+                PROMPTS[prompt_id] = content
+                direct_count += 1
+
+    logger.info(f"Updated {len(custom_prompts)} prompts ({mapped_count} mapped, {direct_count} direct)")
+
+
+def reload_prompts_from_dir(prompt_dir: str | Path, prompt_ext: str = ".md") -> None:
+    """Reload prompts from directory and update global PROMPTS.
+
+    Args:
+        prompt_dir: Directory containing prompt files
+        prompt_ext: File extension to look for
+    """
+    loaded = load_prompts_from_dir(prompt_dir, prompt_ext)
+    update_prompts(loaded)
 
 # All delimiters must be formatted as "<|UPPER_CASE_STRING|>"
 PROMPTS["DEFAULT_TUPLE_DELIMITER"] = "<|#|>"

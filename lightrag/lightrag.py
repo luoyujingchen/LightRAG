@@ -24,7 +24,7 @@ from typing import (
     Dict,
     Union,
 )
-from lightrag.prompt import PROMPTS
+from lightrag.prompt import PROMPTS, load_prompts_from_dir, update_prompts
 from lightrag.exceptions import PipelineCancelledException
 from lightrag.constants import (
     DEFAULT_MAX_GLEANING,
@@ -425,6 +425,17 @@ class LightRAG:
         }
     )
 
+    # Prompt Customization
+    # ---
+
+    prompt_dir: str | None = field(default=None)
+    """Directory containing custom prompt files (.md with optional YAML front matter).
+    If provided, prompts will be loaded from this directory and override defaults."""
+
+    custom_prompts: dict[str, str] | None = field(default=None)
+    """Dict of custom prompts to override defaults. Keys are prompt IDs, values are prompt content.
+    Applied after prompt_dir loading, so these take highest priority."""
+
     # Storages Management
     # ---
 
@@ -503,6 +514,18 @@ class LightRAG:
         # Initialize ollama_server_infos if not provided
         if self.ollama_server_infos is None:
             self.ollama_server_infos = OllamaServerInfos()
+
+        # Load custom prompts
+        if self.prompt_dir:
+            logger.info(f"Loading custom prompts from {self.prompt_dir}")
+            loaded_prompts = load_prompts_from_dir(self.prompt_dir)
+            if loaded_prompts:
+                update_prompts(loaded_prompts)
+                logger.info(f"Loaded {len(loaded_prompts)} custom prompts from directory")
+
+        if self.custom_prompts:
+            logger.info(f"Applying {len(self.custom_prompts)} custom prompts")
+            update_prompts(self.custom_prompts)
 
         # Validate config
         if self.force_llm_summary_on_merge < 3:
@@ -754,6 +777,27 @@ class LightRAG:
                 logger.debug("All storages finalized successfully")
 
             self._storages_status = StoragesStatus.FINALIZED
+
+    def reload_prompts(self, prompt_dir: str | None = None) -> int:
+        """Reload prompts from directory at runtime.
+
+        Args:
+            prompt_dir: Directory to load prompts from. If not provided,
+                       uses self.prompt_dir if set.
+
+        Returns:
+            Number of prompts loaded.
+        """
+        target_dir = prompt_dir or self.prompt_dir
+        if not target_dir:
+            logger.warning("No prompt_dir specified for reload")
+            return 0
+
+        loaded_prompts = load_prompts_from_dir(target_dir)
+        if loaded_prompts:
+            update_prompts(loaded_prompts)
+            logger.info(f"Reloaded {len(loaded_prompts)} prompts from {target_dir}")
+        return len(loaded_prompts)
 
     async def check_and_migrate_data(self):
         """Check if data migration is needed and perform migration if necessary"""
