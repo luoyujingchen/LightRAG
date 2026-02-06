@@ -3,6 +3,7 @@ import os
 import re
 import logging
 import threading
+import copy
 from pathlib import Path
 from typing import Any, Optional
 
@@ -172,17 +173,22 @@ def load_prompts_from_dir(
     return loaded_prompts
 
 
-def update_prompts(custom_prompts: dict[str, str]) -> None:
-    """Update the global PROMPTS dict with custom prompts.
+def update_prompts(
+    custom_prompts: dict[str, str],
+    target_prompts: dict[str, Any] | None = None,
+) -> None:
+    """Update the target PROMPTS dict with custom prompts.
 
     Applies PROMPT_ID_MAPPING to translate custom IDs to LightRAG internal keys.
     Thread-safe via _prompts_lock.
 
     Args:
         custom_prompts: Dict mapping prompt_id to prompt content
+        target_prompts: Dict to update; defaults to global PROMPTS
     """
     mapped_count = 0
     direct_count = 0
+    target = PROMPTS if target_prompts is None else target_prompts
 
     with _prompts_lock:
         resolved_mappings: dict[str, str] = {}
@@ -204,27 +210,32 @@ def update_prompts(custom_prompts: dict[str, str]) -> None:
                         resolved_mappings[internal_key],
                     )
                     continue
-                PROMPTS[internal_key] = content
+                target[internal_key] = content
                 resolved_mappings[internal_key] = prompt_id
                 mapped_count += 1
                 logger.debug(f"Mapped '{prompt_id}' -> '{internal_key}'")
             else:
                 # Use directly (for custom keys or already internal keys)
-                PROMPTS[prompt_id] = content
+                target[prompt_id] = content
                 direct_count += 1
 
     logger.info(f"Updated {len(custom_prompts)} prompts ({mapped_count} mapped, {direct_count} direct)")
 
 
-def reload_prompts_from_dir(prompt_dir: str | Path, prompt_ext: str = ".md") -> None:
-    """Reload prompts from directory and update global PROMPTS.
+def reload_prompts_from_dir(
+    prompt_dir: str | Path,
+    prompt_ext: str = ".md",
+    target_prompts: dict[str, Any] | None = None,
+) -> None:
+    """Reload prompts from directory and update target PROMPTS.
 
     Args:
         prompt_dir: Directory containing prompt files
         prompt_ext: File extension to look for
+        target_prompts: Dict to update; defaults to global PROMPTS
     """
     loaded = load_prompts_from_dir(prompt_dir, prompt_ext)
-    update_prompts(loaded)
+    update_prompts(loaded, target_prompts=target_prompts)
 
 # All delimiters must be formatted as "<|UPPER_CASE_STRING|>"
 PROMPTS["DEFAULT_TUPLE_DELIMITER"] = "<|#|>"
@@ -652,3 +663,11 @@ Output:
 
 """,
 ]
+
+# Snapshot default prompts for per-instance usage
+BASE_PROMPTS = copy.deepcopy(PROMPTS)
+
+
+def create_prompt_store() -> dict[str, Any]:
+    """Create a fresh prompt store based on default prompts."""
+    return copy.deepcopy(BASE_PROMPTS)

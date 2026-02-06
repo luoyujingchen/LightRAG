@@ -75,6 +75,15 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 
+def _resolve_prompts(global_config: dict[str, Any] | None) -> dict[str, Any]:
+    if not global_config:
+        return PROMPTS
+    prompts = global_config.get("prompts")
+    if isinstance(prompts, dict):
+        return prompts
+    return PROMPTS
+
+
 def _truncate_entity_identifier(
     identifier: str, limit: int, chunk_key: str, identifier_role: str
 ) -> str:
@@ -317,10 +326,11 @@ async def _summarize_descriptions(
     use_llm_func = partial(use_llm_func, _priority=8)
 
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
+    prompts = _resolve_prompts(global_config)
 
     summary_length_recommended = global_config["summary_length_recommended"]
 
-    prompt_template = PROMPTS["summarize_entity_descriptions"]
+    prompt_template = prompts["summarize_entity_descriptions"]
 
     # Convert descriptions to JSONL format and apply token-based truncation
     tokenizer = global_config["tokenizer"]
@@ -625,6 +635,10 @@ async def rebuild_knowledge_from_chunks(
     chunk_entities = {}  # chunk_id -> {entity_name: [entity_data]}
     chunk_relationships = {}  # chunk_id -> {(src, tgt): [relationship_data]}
 
+    prompts = _resolve_prompts(global_config)
+    tuple_delimiter = prompts["DEFAULT_TUPLE_DELIMITER"]
+    completion_delimiter = prompts["DEFAULT_COMPLETION_DELIMITER"]
+
     for chunk_id, results in cached_results.items():
         try:
             # Handle multiple extraction results per chunk
@@ -638,6 +652,8 @@ async def rebuild_knowledge_from_chunks(
                     chunk_id=chunk_id,
                     extraction_result=result[0],
                     timestamp=result[1],
+                    tuple_delimiter=tuple_delimiter,
+                    completion_delimiter=completion_delimiter,
                 )
 
                 # Merge entities and relationships from this extraction result
@@ -1060,6 +1076,8 @@ async def _rebuild_from_extraction_result(
     extraction_result: str,
     chunk_id: str,
     timestamp: int,
+    tuple_delimiter: str = "<|#|>",
+    completion_delimiter: str = "<|COMPLETE|>",
 ) -> tuple[dict, dict]:
     """Parse cached extraction result using the same logic as extract_entities
 
@@ -1086,8 +1104,8 @@ async def _rebuild_from_extraction_result(
         chunk_id,
         timestamp,
         file_path,
-        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
-        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        tuple_delimiter=tuple_delimiter,
+        completion_delimiter=completion_delimiter,
     )
 
 
@@ -2813,15 +2831,16 @@ async def extract_entities(
     entity_types = global_config["addon_params"].get(
         "entity_types", DEFAULT_ENTITY_TYPES
     )
+    prompts = _resolve_prompts(global_config)
     relation_types = global_config["addon_params"].get("relation_types", [])
     if isinstance(relation_types, str):
         relation_types = [relation_types]
 
-    examples = "\n".join(PROMPTS["entity_extraction_examples"])
+    examples = "\n".join(prompts["entity_extraction_examples"])
 
     example_context_base = dict(
-        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
-        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        tuple_delimiter=prompts["DEFAULT_TUPLE_DELIMITER"],
+        completion_delimiter=prompts["DEFAULT_COMPLETION_DELIMITER"],
         entity_types=", ".join(entity_types),
         language=language,
     )
@@ -2829,8 +2848,8 @@ async def extract_entities(
     examples = examples.format(**example_context_base)
 
     context_base = dict(
-        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
-        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+        tuple_delimiter=prompts["DEFAULT_TUPLE_DELIMITER"],
+        completion_delimiter=prompts["DEFAULT_COMPLETION_DELIMITER"],
         entity_types=",".join(entity_types),
         relation_types=",".join(relation_types) if relation_types else "",
         examples=examples,
@@ -2860,14 +2879,14 @@ async def extract_entities(
 
         # Get initial extraction
         # Format system prompt without input_text for each chunk (enables OpenAI prompt caching across chunks)
-        entity_extraction_system_prompt = PROMPTS[
+        entity_extraction_system_prompt = prompts[
             "entity_extraction_system_prompt"
         ].format(**context_base)
         # Format user prompts with input_text for each chunk
-        entity_extraction_user_prompt = PROMPTS["entity_extraction_user_prompt"].format(
+        entity_extraction_user_prompt = prompts["entity_extraction_user_prompt"].format(
             **{**context_base, "input_text": content}
         )
-        entity_continue_extraction_user_prompt = PROMPTS[
+        entity_continue_extraction_user_prompt = prompts[
             "entity_continue_extraction_user_prompt"
         ].format(**{**context_base, "input_text": content})
 
@@ -3081,8 +3100,9 @@ async def kg_query(
 
         Returns None when no relevant context could be constructed for the query.
     """
+    prompts = _resolve_prompts(global_config)
     if not query:
-        return QueryResult(content=PROMPTS["fail_response"])
+        return QueryResult(content=prompts["fail_response"])
 
     if query_param.model_func:
         use_model_func = query_param.model_func
@@ -3108,7 +3128,7 @@ async def kg_query(
             logger.warning(f"Forced low_level_keywords to origin query: {query}")
             ll_keywords = [query]
         else:
-            return QueryResult(content=PROMPTS["fail_response"])
+            return QueryResult(content=prompts["fail_response"])
 
     ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
     hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
@@ -3144,7 +3164,7 @@ async def kg_query(
     )
 
     # Build system prompt
-    sys_prompt_temp = system_prompt if system_prompt else PROMPTS["rag_response"]
+    sys_prompt_temp = system_prompt if system_prompt else prompts["rag_response"]
     sys_prompt = sys_prompt_temp.format(
         response_type=response_type,
         user_prompt=user_prompt,
@@ -3292,9 +3312,10 @@ async def extract_keywords_only(
     This method does NOT build the final RAG context or provide a final answer.
     It ONLY extracts keywords (hl_keywords, ll_keywords).
     """
+    prompts = _resolve_prompts(global_config)
 
     # 1. Build the examples
-    examples = "\n".join(PROMPTS["keywords_extraction_examples"])
+    examples = "\n".join(prompts["keywords_extraction_examples"])
 
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
 
@@ -3320,7 +3341,7 @@ async def extract_keywords_only(
             )
 
     # 3. Build the keyword-extraction prompt
-    kw_prompt = PROMPTS["keywords_extraction"].format(
+    kw_prompt = prompts["keywords_extraction"].format(
         query=text,
         examples=examples,
         language=language,
@@ -3927,12 +3948,14 @@ async def _build_context_str(
         global_config.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
     )
 
+    prompts = _resolve_prompts(global_config)
+
     # Get the system prompt template from PROMPTS or global_config
     sys_prompt_template = global_config.get(
-        "system_prompt_template", PROMPTS["rag_response"]
+        "system_prompt_template", prompts["rag_response"]
     )
 
-    kg_context_template = PROMPTS["kg_query_context"]
+    kg_context_template = prompts["kg_query_context"]
     user_prompt = query_param.user_prompt if query_param.user_prompt else ""
     response_type = (
         query_param.response_type
@@ -4808,11 +4831,12 @@ async def naive_query(
             - raw_data: Complete structured data (including references and metadata)
             - is_streaming: Whether this is a streaming result
 
-        Returns None when no relevant chunks are retrieved.
+    Returns None when no relevant chunks are retrieved.
     """
+    prompts = _resolve_prompts(global_config)
 
     if not query:
-        return QueryResult(content=PROMPTS["fail_response"])
+        return QueryResult(content=prompts["fail_response"])
 
     if query_param.model_func:
         use_model_func = query_param.model_func
@@ -4824,7 +4848,7 @@ async def naive_query(
     tokenizer: Tokenizer = global_config["tokenizer"]
     if not tokenizer:
         logger.error("Tokenizer not found in global configuration.")
-        return QueryResult(content=PROMPTS["fail_response"])
+        return QueryResult(content=prompts["fail_response"])
 
     chunks = await _get_vector_context(query, chunks_vdb, query_param, None)
 
@@ -4851,7 +4875,7 @@ async def naive_query(
 
     # Use the provided system prompt or default
     sys_prompt_template = (
-        system_prompt if system_prompt else PROMPTS["naive_rag_response"]
+        system_prompt if system_prompt else prompts["naive_rag_response"]
     )
 
     # Create a preliminary system prompt with empty content_data to calculate overhead
@@ -4930,7 +4954,7 @@ async def naive_query(
         if ref["reference_id"]
     )
 
-    naive_context_template = PROMPTS["naive_query_context"]
+    naive_context_template = prompts["naive_query_context"]
     context_content = naive_context_template.format(
         text_chunks_str=text_units_str,
         reference_list_str=reference_list_str,

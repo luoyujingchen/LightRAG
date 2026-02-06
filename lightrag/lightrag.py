@@ -24,7 +24,12 @@ from typing import (
     Dict,
     Union,
 )
-from lightrag.prompt import PROMPTS, load_prompts_from_dir, update_prompts
+from lightrag.prompt import (
+    PROMPTS,
+    create_prompt_store,
+    load_prompts_from_dir,
+    update_prompts,
+)
 from lightrag.exceptions import PipelineCancelledException
 from lightrag.constants import (
     DEFAULT_MAX_GLEANING,
@@ -428,6 +433,9 @@ class LightRAG:
     # Prompt Customization
     # ---
 
+    prompts: dict[str, Any] | None = field(default=None)
+    """Prompt dictionary scoped to this LightRAG instance."""
+
     prompt_dir: str | None = field(default=None)
     """Directory containing custom prompt files (.md with optional YAML front matter).
     If provided, prompts will be loaded from this directory and override defaults."""
@@ -515,17 +523,20 @@ class LightRAG:
         if self.ollama_server_infos is None:
             self.ollama_server_infos = OllamaServerInfos()
 
+        if self.prompts is None:
+            self.prompts = create_prompt_store()
+
         # Load custom prompts
         if self.prompt_dir:
             logger.info(f"Loading custom prompts from {self.prompt_dir}")
             loaded_prompts = load_prompts_from_dir(self.prompt_dir)
             if loaded_prompts:
-                update_prompts(loaded_prompts)
+                update_prompts(loaded_prompts, target_prompts=self.prompts)
                 logger.info(f"Loaded {len(loaded_prompts)} custom prompts from directory")
 
         if self.custom_prompts:
             logger.info(f"Applying {len(self.custom_prompts)} custom prompts")
-            update_prompts(self.custom_prompts)
+            update_prompts(self.custom_prompts, target_prompts=self.prompts)
 
         # Validate config
         if self.force_llm_summary_on_merge < 3:
@@ -779,24 +790,33 @@ class LightRAG:
             self._storages_status = StoragesStatus.FINALIZED
 
     def reload_prompts(self, prompt_dir: str | None = None) -> int:
-        """Reload prompts from directory at runtime.
+        """Reload prompts for this instance.
 
         Args:
             prompt_dir: Directory to load prompts from. If not provided,
                        uses self.prompt_dir if set.
 
         Returns:
-            Number of prompts loaded.
+            Number of prompts loaded from prompt_dir.
         """
         target_dir = prompt_dir or self.prompt_dir
-        if not target_dir:
+        if not target_dir and not self.custom_prompts:
             logger.warning("No prompt_dir specified for reload")
             return 0
 
-        loaded_prompts = load_prompts_from_dir(target_dir)
-        if loaded_prompts:
-            update_prompts(loaded_prompts)
-            logger.info(f"Reloaded {len(loaded_prompts)} prompts from {target_dir}")
+        # Reset to base prompts before applying overrides
+        self.prompts = create_prompt_store()
+
+        loaded_prompts: dict[str, str] = {}
+        if target_dir:
+            loaded_prompts = load_prompts_from_dir(target_dir)
+            if loaded_prompts:
+                update_prompts(loaded_prompts, target_prompts=self.prompts)
+                logger.info(f"Reloaded {len(loaded_prompts)} prompts from {target_dir}")
+
+        if self.custom_prompts:
+            update_prompts(self.custom_prompts, target_prompts=self.prompts)
+
         return len(loaded_prompts)
 
     async def check_and_migrate_data(self):
@@ -2775,6 +2795,7 @@ class LightRAG:
             dict[str, Any]: Complete response with structured data and LLM response.
         """
         logger.debug(f"[aquery_llm] Query param: {param}")
+        prompts = self.prompts or PROMPTS
 
         global_config = asdict(self)
 
@@ -2857,7 +2878,7 @@ class LightRAG:
                         "mode": param.mode,
                     },
                     "llm_response": {
-                        "content": PROMPTS["fail_response"],
+                        "content": prompts["fail_response"],
                         "response_iterator": None,
                         "is_streaming": False,
                     },
