@@ -953,7 +953,7 @@ async def _process_extraction_result(
     file_path: str = "unknown_source",
     tuple_delimiter: str = "<|#|>",
     completion_delimiter: str = "<|COMPLETE|>",
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, bool]:
     """Process a single extraction result (either initial or gleaning)
     Args:
         result (str): The extraction result to process
@@ -963,15 +963,18 @@ async def _process_extraction_result(
         record_delimiter (str): Delimiter for records
         completion_delimiter (str): Delimiter for completion
     Returns:
-        tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
+        tuple: (nodes_dict, edges_dict, format_error) containing the extracted entities,
+        relationships, and whether a format error was detected.
     """
     maybe_nodes = defaultdict(list)
     maybe_edges = defaultdict(list)
+    format_error = False
 
     if completion_delimiter not in result:
         logger.warning(
             f"{chunk_key}: Complete delimiter can not be found in extraction result"
         )
+        format_error = True
 
     # Split LLL output result to records by "\n"
     records = split_string_by_multi_markers(
@@ -1014,6 +1017,7 @@ async def _process_extraction_result(
         logger.warning(
             f"{chunk_key}: LLM output format error; find LLM use {tuple_delimiter} as record seperators instead new-line"
         )
+        format_error = True
 
     for record in fixed_records:
         record = record.strip()
@@ -1031,6 +1035,12 @@ async def _process_extraction_result(
             )
 
         record_attributes = split_string_by_multi_markers(record, [tuple_delimiter])
+        if record_attributes:
+            header = record_attributes[0].lower()
+            if "entity" in header and len(record_attributes) != 4:
+                format_error = True
+            if "relation" in header and len(record_attributes) < 5:
+                format_error = True
 
         # Try to parse as entity
         entity_data = await _handle_single_entity_extraction(
@@ -1068,7 +1078,7 @@ async def _process_extraction_result(
             relationship_data["tgt_id"] = truncated_target
             maybe_edges[(truncated_source, truncated_target)].append(relationship_data)
 
-    return dict(maybe_nodes), dict(maybe_edges)
+    return dict(maybe_nodes), dict(maybe_edges), format_error
 
 
 async def _rebuild_from_extraction_result(
@@ -1099,7 +1109,7 @@ async def _rebuild_from_extraction_result(
     )
 
     # Call the shared processing function
-    return await _process_extraction_result(
+    nodes, edges, _ = await _process_extraction_result(
         extraction_result,
         chunk_id,
         timestamp,
@@ -1107,6 +1117,7 @@ async def _rebuild_from_extraction_result(
         tuple_delimiter=tuple_delimiter,
         completion_delimiter=completion_delimiter,
     )
+    return nodes, edges
 
 
 async def _rebuild_single_entity(
@@ -2867,6 +2878,11 @@ async def extract_entities(
         Returns:
             tuple: (maybe_nodes, maybe_edges) containing extracted entities and relationships
         """
+        def _should_retry_invalid(result_text: str, has_format_error: bool) -> bool:
+            if not result_text or not result_text.strip():
+                return True
+            return has_format_error
+
         nonlocal processed_chunks
         chunk_key = chunk_key_dp[0]
         chunk_dp = chunk_key_dp[1]
@@ -2875,7 +2891,7 @@ async def extract_entities(
         file_path = chunk_dp.get("file_path", "unknown_source")
 
         # Create cache keys collector for batch processing
-        cache_keys_collector = []
+        initial_cache_keys: list[str] = []
 
         # Get initial extraction
         # Format system prompt without input_text for each chunk (enables OpenAI prompt caching across chunks)
@@ -2897,15 +2913,11 @@ async def extract_entities(
             llm_response_cache=llm_response_cache,
             cache_type="extract",
             chunk_id=chunk_key,
-            cache_keys_collector=cache_keys_collector,
-        )
-
-        history = pack_user_ass_to_openai_messages(
-            entity_extraction_user_prompt, final_result
+            cache_keys_collector=initial_cache_keys,
         )
 
         # Process initial extraction with file path
-        maybe_nodes, maybe_edges = await _process_extraction_result(
+        maybe_nodes, maybe_edges, format_error = await _process_extraction_result(
             final_result,
             chunk_key,
             timestamp,
@@ -2913,8 +2925,33 @@ async def extract_entities(
             tuple_delimiter=context_base["tuple_delimiter"],
             completion_delimiter=context_base["completion_delimiter"],
         )
+        if _should_retry_invalid(final_result, format_error):
+            if llm_response_cache and initial_cache_keys:
+                await llm_response_cache.delete(initial_cache_keys)
+            final_result, timestamp = await use_llm_func_with_cache(
+                entity_extraction_user_prompt,
+                use_llm_func,
+                system_prompt=entity_extraction_system_prompt,
+                llm_response_cache=None,
+                cache_type="extract",
+                chunk_id=chunk_key,
+            )
+            maybe_nodes, maybe_edges, _ = await _process_extraction_result(
+                final_result,
+                chunk_key,
+                timestamp,
+                file_path,
+                tuple_delimiter=context_base["tuple_delimiter"],
+                completion_delimiter=context_base["completion_delimiter"],
+            )
+            initial_cache_keys = []
+
+        history = pack_user_ass_to_openai_messages(
+            entity_extraction_user_prompt, final_result
+        )
 
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
+        glean_cache_keys: list[str] = []
         if entity_extract_max_gleaning > 0:
             glean_result, timestamp = await use_llm_func_with_cache(
                 entity_continue_extraction_user_prompt,
@@ -2924,11 +2961,11 @@ async def extract_entities(
                 history_messages=history,
                 cache_type="extract",
                 chunk_id=chunk_key,
-                cache_keys_collector=cache_keys_collector,
+                cache_keys_collector=glean_cache_keys,
             )
 
             # Process gleaning result separately with file path
-            glean_nodes, glean_edges = await _process_extraction_result(
+            glean_nodes, glean_edges, glean_format_error = await _process_extraction_result(
                 glean_result,
                 chunk_key,
                 timestamp,
@@ -2936,6 +2973,27 @@ async def extract_entities(
                 tuple_delimiter=context_base["tuple_delimiter"],
                 completion_delimiter=context_base["completion_delimiter"],
             )
+            if _should_retry_invalid(glean_result, glean_format_error):
+                if llm_response_cache and glean_cache_keys:
+                    await llm_response_cache.delete(glean_cache_keys)
+                glean_result, timestamp = await use_llm_func_with_cache(
+                    entity_continue_extraction_user_prompt,
+                    use_llm_func,
+                    system_prompt=entity_extraction_system_prompt,
+                    llm_response_cache=None,
+                    history_messages=history,
+                    cache_type="extract",
+                    chunk_id=chunk_key,
+                )
+                glean_nodes, glean_edges, _ = await _process_extraction_result(
+                    glean_result,
+                    chunk_key,
+                    timestamp,
+                    file_path,
+                    tuple_delimiter=context_base["tuple_delimiter"],
+                    completion_delimiter=context_base["completion_delimiter"],
+                )
+                glean_cache_keys = []
 
             # Merge results - compare description lengths to choose better version
             for entity_name, glean_entities in glean_nodes.items():
@@ -2969,11 +3027,12 @@ async def extract_entities(
                     maybe_edges[edge_key] = list(glean_edges)
 
         # Batch update chunk's llm_cache_list with all collected cache keys
-        if cache_keys_collector and text_chunks_storage:
+        cache_keys = initial_cache_keys + glean_cache_keys
+        if cache_keys and text_chunks_storage:
             await update_chunk_cache_list(
                 chunk_key,
                 text_chunks_storage,
-                cache_keys_collector,
+                cache_keys,
                 "entity_extraction",
             )
 
