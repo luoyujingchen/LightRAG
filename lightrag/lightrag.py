@@ -2098,6 +2098,32 @@ class LightRAG:
                                 # Record processing end time
                                 processing_end_time = int(time.time())
 
+                                existing_metadata: dict[str, Any] = {}
+                                try:
+                                    existing_doc = await self.doc_status.get_by_id(
+                                        doc_id
+                                    )
+                                    if existing_doc and isinstance(
+                                        existing_doc.get("metadata"), dict
+                                    ):
+                                        existing_metadata = dict(
+                                            existing_doc.get("metadata") or {}
+                                        )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "Failed to fetch doc_status metadata for %s: %s",
+                                        doc_id,
+                                        exc,
+                                    )
+
+                                metadata = dict(existing_metadata)
+                                metadata.update(
+                                    {
+                                        "processing_start_time": processing_start_time,
+                                        "processing_end_time": processing_end_time,
+                                    }
+                                )
+
                                 await self.doc_status.upsert(
                                     {
                                         doc_id: {
@@ -2112,10 +2138,7 @@ class LightRAG:
                                             ).isoformat(),
                                             "file_path": file_path,
                                             "track_id": status_doc.track_id,  # Preserve existing track_id
-                                            "metadata": {
-                                                "processing_start_time": processing_start_time,
-                                                "processing_end_time": processing_end_time,
-                                            },
+                                            "metadata": metadata,
                                         }
                                     }
                                 )
@@ -2269,6 +2292,7 @@ class LightRAG:
                 pipeline_status_lock=pipeline_status_lock,
                 llm_response_cache=self.llm_response_cache,
                 text_chunks_storage=self.text_chunks,
+                doc_status_storage=self.doc_status,
             )
             return chunk_results
         except Exception as e:

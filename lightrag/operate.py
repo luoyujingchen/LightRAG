@@ -1,6 +1,7 @@
 from __future__ import annotations
 from functools import partial
 from pathlib import Path
+from datetime import datetime, timezone
 
 import asyncio
 import json
@@ -44,6 +45,7 @@ from lightrag.base import (
     BaseGraphStorage,
     BaseKVStorage,
     BaseVectorStorage,
+    DocStatusStorage,
     TextChunkSchema,
     QueryParam,
     QueryResult,
@@ -953,7 +955,7 @@ async def _process_extraction_result(
     file_path: str = "unknown_source",
     tuple_delimiter: str = "<|#|>",
     completion_delimiter: str = "<|COMPLETE|>",
-) -> tuple[dict, dict, bool]:
+) -> tuple[dict, dict, bool, int]:
     """Process a single extraction result (either initial or gleaning)
     Args:
         result (str): The extraction result to process
@@ -963,18 +965,21 @@ async def _process_extraction_result(
         record_delimiter (str): Delimiter for records
         completion_delimiter (str): Delimiter for completion
     Returns:
-        tuple: (nodes_dict, edges_dict, format_error) containing the extracted entities,
-        relationships, and whether a format error was detected.
+        tuple: (nodes_dict, edges_dict, format_error, format_error_count) containing the
+        extracted entities, relationships, whether a format error was detected, and the
+        number of detected format errors.
     """
     maybe_nodes = defaultdict(list)
     maybe_edges = defaultdict(list)
     format_error = False
+    format_error_count = 0
 
     if completion_delimiter not in result:
         logger.warning(
             f"{chunk_key}: Complete delimiter can not be found in extraction result"
         )
         format_error = True
+        format_error_count += 1
 
     # Split LLL output result to records by "\n"
     records = split_string_by_multi_markers(
@@ -1018,6 +1023,7 @@ async def _process_extraction_result(
             f"{chunk_key}: LLM output format error; find LLM use {tuple_delimiter} as record seperators instead new-line"
         )
         format_error = True
+        format_error_count += 1
 
     for record in fixed_records:
         record = record.strip()
@@ -1039,8 +1045,10 @@ async def _process_extraction_result(
             header = record_attributes[0].lower()
             if "entity" in header and len(record_attributes) != 4:
                 format_error = True
+                format_error_count += 1
             if "relation" in header and len(record_attributes) < 5:
                 format_error = True
+                format_error_count += 1
 
         # Try to parse as entity
         entity_data = await _handle_single_entity_extraction(
@@ -1078,7 +1086,7 @@ async def _process_extraction_result(
             relationship_data["tgt_id"] = truncated_target
             maybe_edges[(truncated_source, truncated_target)].append(relationship_data)
 
-    return dict(maybe_nodes), dict(maybe_edges), format_error
+    return dict(maybe_nodes), dict(maybe_edges), format_error, format_error_count
 
 
 async def _rebuild_from_extraction_result(
@@ -1109,7 +1117,7 @@ async def _rebuild_from_extraction_result(
     )
 
     # Call the shared processing function
-    nodes, edges, _ = await _process_extraction_result(
+    nodes, edges, _, _ = await _process_extraction_result(
         extraction_result,
         chunk_id,
         timestamp,
@@ -2824,6 +2832,7 @@ async def extract_entities(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
     text_chunks_storage: BaseKVStorage | None = None,
+    doc_status_storage: DocStatusStorage | None = None,
 ) -> list:
     # Check for cancellation at the start of entity extraction
     if pipeline_status is not None and pipeline_status_lock is not None:
@@ -2835,6 +2844,9 @@ async def extract_entities(
 
     use_llm_func: callable = global_config["llm_model_func"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
+    entity_extract_format_retry = max(
+        0, int(global_config.get("entity_extract_format_retry", 1))
+    )
 
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
@@ -2869,6 +2881,10 @@ async def extract_entities(
 
     processed_chunks = 0
     total_chunks = len(ordered_chunks)
+    format_error_counts_by_doc: Counter[str] = Counter()
+    format_error_chunks_by_doc: Counter[str] = Counter()
+    chunk_counts_by_doc: Counter[str] = Counter()
+    format_error_counts_lock = asyncio.Lock()
 
     async def _process_single_content(chunk_key_dp: tuple[str, TextChunkSchema]):
         """Process a single chunk
@@ -2887,6 +2903,8 @@ async def extract_entities(
         chunk_key = chunk_key_dp[0]
         chunk_dp = chunk_key_dp[1]
         content = chunk_dp["content"]
+        full_doc_id = chunk_dp.get("full_doc_id", "unknown_doc")
+        chunk_order_index = chunk_dp.get("chunk_order_index")
         # Get file path from chunk data or use default
         file_path = chunk_dp.get("file_path", "unknown_source")
 
@@ -2906,37 +2924,36 @@ async def extract_entities(
             "entity_continue_extraction_user_prompt"
         ].format(**{**context_base, "input_text": content})
 
-        final_result, timestamp = await use_llm_func_with_cache(
-            entity_extraction_user_prompt,
-            use_llm_func,
-            system_prompt=entity_extraction_system_prompt,
-            llm_response_cache=llm_response_cache,
-            cache_type="extract",
-            chunk_id=chunk_key,
-            cache_keys_collector=initial_cache_keys,
-        )
-
-        # Process initial extraction with file path
-        maybe_nodes, maybe_edges, format_error = await _process_extraction_result(
-            final_result,
-            chunk_key,
-            timestamp,
-            file_path,
-            tuple_delimiter=context_base["tuple_delimiter"],
-            completion_delimiter=context_base["completion_delimiter"],
-        )
-        if _should_retry_invalid(final_result, format_error):
-            if llm_response_cache and initial_cache_keys:
-                await llm_response_cache.delete(initial_cache_keys)
+        final_result = ""
+        timestamp = 0
+        maybe_nodes: dict = {}
+        maybe_edges: dict = {}
+        format_error = False
+        initial_attempts_used = 0
+        glean_attempts_used = 0
+        initial_final_invalid = False
+        glean_final_invalid = False
+        max_attempts = 1 + entity_extract_format_retry
+        for attempt in range(1, max_attempts + 1):
+            use_cache = attempt == 1
+            cache_storage = llm_response_cache if use_cache else None
+            cache_keys_collector = initial_cache_keys if use_cache else None
             final_result, timestamp = await use_llm_func_with_cache(
                 entity_extraction_user_prompt,
                 use_llm_func,
                 system_prompt=entity_extraction_system_prompt,
-                llm_response_cache=None,
+                llm_response_cache=cache_storage,
                 cache_type="extract",
                 chunk_id=chunk_key,
+                cache_keys_collector=cache_keys_collector,
             )
-            maybe_nodes, maybe_edges, _ = await _process_extraction_result(
+
+            (
+                maybe_nodes,
+                maybe_edges,
+                format_error,
+                _format_error_count,
+            ) = await _process_extraction_result(
                 final_result,
                 chunk_key,
                 timestamp,
@@ -2944,7 +2961,19 @@ async def extract_entities(
                 tuple_delimiter=context_base["tuple_delimiter"],
                 completion_delimiter=context_base["completion_delimiter"],
             )
-            initial_cache_keys = []
+            initial_attempts_used = attempt
+            if not _should_retry_invalid(final_result, format_error):
+                break
+            if use_cache and llm_response_cache and initial_cache_keys:
+                await llm_response_cache.delete(initial_cache_keys)
+                initial_cache_keys = []
+            if attempt < max_attempts:
+                logger.warning(
+                    f"{chunk_key}: LLM output invalid, retrying extraction "
+                    f"{attempt}/{entity_extract_format_retry}"
+                )
+
+        initial_final_invalid = _should_retry_invalid(final_result, format_error)
 
         history = pack_user_ass_to_openai_messages(
             entity_extraction_user_prompt, final_result
@@ -2953,39 +2982,31 @@ async def extract_entities(
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
         glean_cache_keys: list[str] = []
         if entity_extract_max_gleaning > 0:
-            glean_result, timestamp = await use_llm_func_with_cache(
-                entity_continue_extraction_user_prompt,
-                use_llm_func,
-                system_prompt=entity_extraction_system_prompt,
-                llm_response_cache=llm_response_cache,
-                history_messages=history,
-                cache_type="extract",
-                chunk_id=chunk_key,
-                cache_keys_collector=glean_cache_keys,
-            )
-
-            # Process gleaning result separately with file path
-            glean_nodes, glean_edges, glean_format_error = await _process_extraction_result(
-                glean_result,
-                chunk_key,
-                timestamp,
-                file_path,
-                tuple_delimiter=context_base["tuple_delimiter"],
-                completion_delimiter=context_base["completion_delimiter"],
-            )
-            if _should_retry_invalid(glean_result, glean_format_error):
-                if llm_response_cache and glean_cache_keys:
-                    await llm_response_cache.delete(glean_cache_keys)
+            glean_result = ""
+            glean_nodes: dict = {}
+            glean_edges: dict = {}
+            max_glean_attempts = 1 + entity_extract_format_retry
+            for attempt in range(1, max_glean_attempts + 1):
+                use_cache = attempt == 1
+                cache_storage = llm_response_cache if use_cache else None
+                cache_keys_collector = glean_cache_keys if use_cache else None
                 glean_result, timestamp = await use_llm_func_with_cache(
                     entity_continue_extraction_user_prompt,
                     use_llm_func,
                     system_prompt=entity_extraction_system_prompt,
-                    llm_response_cache=None,
+                    llm_response_cache=cache_storage,
                     history_messages=history,
                     cache_type="extract",
                     chunk_id=chunk_key,
+                    cache_keys_collector=cache_keys_collector,
                 )
-                glean_nodes, glean_edges, _ = await _process_extraction_result(
+
+                (
+                    glean_nodes,
+                    glean_edges,
+                    glean_format_error,
+                    _glean_format_error_count,
+                ) = await _process_extraction_result(
                     glean_result,
                     chunk_key,
                     timestamp,
@@ -2993,7 +3014,21 @@ async def extract_entities(
                     tuple_delimiter=context_base["tuple_delimiter"],
                     completion_delimiter=context_base["completion_delimiter"],
                 )
-                glean_cache_keys = []
+                glean_attempts_used = attempt
+                if not _should_retry_invalid(glean_result, glean_format_error):
+                    break
+                if use_cache and llm_response_cache and glean_cache_keys:
+                    await llm_response_cache.delete(glean_cache_keys)
+                    glean_cache_keys = []
+                if attempt < max_glean_attempts:
+                    logger.warning(
+                        f"{chunk_key}: LLM output invalid, retrying gleaning "
+                        f"{attempt}/{entity_extract_format_retry}"
+                    )
+
+            glean_final_invalid = _should_retry_invalid(
+                glean_result, glean_format_error
+            )
 
             # Merge results - compare description lengths to choose better version
             for entity_name, glean_entities in glean_nodes.items():
@@ -3025,6 +3060,30 @@ async def extract_entities(
                 else:
                     # New edge from gleaning stage
                     maybe_edges[edge_key] = list(glean_edges)
+
+        format_error_total = int(initial_final_invalid) + int(glean_final_invalid)
+        async with format_error_counts_lock:
+            chunk_counts_by_doc[full_doc_id] += 1
+            format_error_counts_by_doc[full_doc_id] += format_error_total
+            if format_error_total > 0:
+                format_error_chunks_by_doc[full_doc_id] += 1
+
+        format_error_stats = {
+            "event": "llm_format_error_stats",
+            "scope": "chunk",
+            "full_doc_id": full_doc_id,
+            "chunk_key": chunk_key,
+            "chunk_order_index": chunk_order_index,
+            "format_error_count": format_error_total,
+            "format_error_initial": int(initial_final_invalid),
+            "format_error_gleaning": int(glean_final_invalid),
+            "attempts_initial": initial_attempts_used,
+            "attempts_gleaning": glean_attempts_used,
+        }
+        logger.info(
+            "[FORMAT_ERROR_STATS] %s",
+            json.dumps(format_error_stats, ensure_ascii=False),
+        )
 
         # Batch update chunk's llm_cache_list with all collected cache keys
         cache_keys = initial_cache_keys + glean_cache_keys
@@ -3113,6 +3172,48 @@ async def extract_entities(
         raise prefixed_exception from first_exception
 
     # If all tasks completed successfully, chunk_results already contains the results
+    async with format_error_counts_lock:
+        doc_format_counts = dict(format_error_counts_by_doc)
+        doc_chunk_counts = dict(chunk_counts_by_doc)
+        doc_error_chunks = dict(format_error_chunks_by_doc)
+
+    for doc_id, error_count in doc_format_counts.items():
+        doc_stats = {
+            "event": "llm_format_error_stats",
+            "scope": "doc",
+            "full_doc_id": doc_id,
+            "format_error_count": error_count,
+            "chunks_total": doc_chunk_counts.get(doc_id, 0),
+            "chunks_with_errors": doc_error_chunks.get(doc_id, 0),
+        }
+        logger.info(
+            "[FORMAT_ERROR_STATS] %s",
+            json.dumps(doc_stats, ensure_ascii=False),
+        )
+
+    if doc_status_storage:
+        for doc_id, error_count in doc_format_counts.items():
+            try:
+                status_doc = await doc_status_storage.get_by_id(doc_id)
+                if not status_doc:
+                    continue
+                metadata = status_doc.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["format_error_stats"] = {
+                    "format_error_count": error_count,
+                    "chunks_total": doc_chunk_counts.get(doc_id, 0),
+                    "chunks_with_errors": doc_error_chunks.get(doc_id, 0),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                status_doc["metadata"] = metadata
+                status_doc["updated_at"] = datetime.now(timezone.utc).isoformat()
+                await doc_status_storage.upsert({doc_id: status_doc})
+            except Exception as exc:
+                logger.warning(
+                    "Failed to persist format_error_stats for %s: %s", doc_id, exc
+                )
+
     # Return the chunk_results for later processing in merge_nodes_and_edges
     return chunk_results
 
